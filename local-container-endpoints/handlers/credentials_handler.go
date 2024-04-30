@@ -14,19 +14,16 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/endpoints"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/iam"
-	"github.com/aws/aws-sdk-go/service/iam/iamiface"
-	"github.com/aws/aws-sdk-go/service/sts"
-	"github.com/aws/aws-sdk-go/service/sts/stsiface"
-	"github.com/awslabs/amazon-ecs-local-container-endpoints/local-container-endpoints/clients/useragent"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	aws_config "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/iam"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/awslabs/amazon-ecs-local-container-endpoints/local-container-endpoints/config"
 	"github.com/awslabs/amazon-ecs-local-container-endpoints/local-container-endpoints/utils"
 	"github.com/gorilla/mux"
@@ -46,61 +43,29 @@ const (
 
 // CredentialService vends credentials to containers
 type CredentialService struct {
-	iamClient      iamiface.IAMAPI
-	stsClient      stsiface.STSAPI
-	currentSession *session.Session
+	iamClient      *iam.Client
+	stsClient      *sts.Client
+	currentConfig *aws.Config
 }
 
 // NewCredentialService returns a struct that handles credentials requests
 func NewCredentialService() (*CredentialService, error) {
-	iamCustomEndpoint := utils.GetValue("", config.IAMCustomEndpointVar)
-	if iamCustomEndpoint != "" {
-		logrus.Infof("Using custom IAM endpoint %s", iamCustomEndpoint)
-	}
+	cfg, err := aws_config.LoadDefaultConfig(context.TODO())
+				if err != nil {
+					return nil, err
+				}
 
-	stsCustomEndpoint := utils.GetValue("", config.STSCustomEndpointVar)
-	if stsCustomEndpoint != "" {
-		logrus.Infof("Using custom STS endpoint %s", stsCustomEndpoint)
-	}
-
-	defaultResolver := endpoints.DefaultResolver()
-	customResolverFn := func(service, region string, optFns ...func(*endpoints.Options)) (endpoints.ResolvedEndpoint, error) {
-		if service == endpoints.IamServiceID && iamCustomEndpoint != "" {
-			return endpoints.ResolvedEndpoint{
-				URL: iamCustomEndpoint,
-			}, nil
-		} else if service == endpoints.StsServiceID && stsCustomEndpoint != "" {
-			return endpoints.ResolvedEndpoint{
-				URL: stsCustomEndpoint,
-			}, nil
-		}
-		return defaultResolver.EndpointFor(service, region, optFns...)
-	}
-
-	sess, err := session.NewSessionWithOptions(session.Options{
-		Config: aws.Config{
-			EndpointResolver:              endpoints.ResolverFunc(customResolverFn),
-			CredentialsChainVerboseErrors: aws.Bool(true),
-		},
-		SharedConfigState: session.SharedConfigEnable,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	iamClient := iam.New(sess)
-	iamClient.Handlers.Build.PushBackNamed(useragent.CustomUserAgentHandler())
-	stsClient := sts.New(sess)
-	stsClient.Handlers.Build.PushBackNamed(useragent.CustomUserAgentHandler())
-	return NewCredentialServiceWithClients(iamClient, stsClient, sess), nil
+	iamClient := iam.NewFromConfig(cfg)
+	stsClient := sts.NewFromConfig(cfg)
+	return NewCredentialServiceWithClients(iamClient, stsClient, cfg), nil
 }
 
 // NewCredentialServiceWithClients returns a struct that handles credentials requests with the given clients
-func NewCredentialServiceWithClients(iamClient iamiface.IAMAPI, stsClient stsiface.STSAPI, currentSession *session.Session) *CredentialService {
+func NewCredentialServiceWithClients(iamClient *iam.Client, stsClient *sts.Client, currentConfig aws.Config) *CredentialService {
 	return &CredentialService{
 		iamClient:      iamClient,
 		stsClient:      stsClient,
-		currentSession: currentSession,
+		currentConfig:  &currentConfig,
 	}
 }
 
@@ -168,22 +133,23 @@ func (service *CredentialService) getRoleArnHandler() func(w http.ResponseWriter
 func (service *CredentialService) getRoleCredentials(roleName string) (*CredentialResponse, error) {
 	logrus.Debugf("Requesting credentials for %s", roleName)
 
-	output, err := service.iamClient.GetRole(&iam.GetRoleInput{
+	output, err := service.iamClient.GetRole(context.TODO(),
+	&iam.GetRoleInput{
 		RoleName: aws.String(roleName),
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	return service.getRoleCredentialsFromArn(aws.StringValue(output.Role.Arn), roleName)
+	return service.getRoleCredentialsFromArn(*output.Role.Arn, roleName)
 }
 
 func (service *CredentialService) getRoleCredentialsFromArn(roleArn, roleName string) (*CredentialResponse, error) {
 	logrus.Debugf("Requesting credentials for role with ARN %s", roleArn)
 
-	creds, err := service.stsClient.AssumeRole(&sts.AssumeRoleInput{
+	creds, err := service.stsClient.AssumeRole(context.TODO(), &sts.AssumeRoleInput{
 		RoleArn:         aws.String(roleArn),
-		DurationSeconds: aws.Int64(temporaryCredentialsDurationInS),
+		DurationSeconds: aws.Int32(temporaryCredentialsDurationInS),
 		RoleSessionName: aws.String(utils.Truncate(fmt.Sprintf("ecs-local-%s", roleName), roleSessionNameLength)),
 	})
 
@@ -192,10 +158,10 @@ func (service *CredentialService) getRoleCredentialsFromArn(roleArn, roleName st
 	}
 
 	return &CredentialResponse{
-		AccessKeyID:     aws.StringValue(creds.Credentials.AccessKeyId),
-		SecretAccessKey: aws.StringValue(creds.Credentials.SecretAccessKey),
+		AccessKeyID:     *creds.Credentials.AccessKeyId,
+		SecretAccessKey: *creds.Credentials.SecretAccessKey,
 		RoleArn:         roleArn,
-		Token:           aws.StringValue(creds.Credentials.SessionToken),
+		Token:           *creds.Credentials.SessionToken,
 		Expiration:      creds.Credentials.Expiration.Format(CredentialExpirationTimeFormat),
 	}, nil
 }
@@ -219,7 +185,7 @@ func (service *CredentialService) getTemporaryCredentials() (*CredentialResponse
 	// check if the current session already was built on temp creds
 	// because temp creds do not have the power to call GetSessionToken
 	if service.isCurrentSessionTemporary() {
-		credVal, err := service.currentSession.Config.Credentials.Get()
+		credVal, err := service.currentConfig.Credentials.Retrieve(context.TODO())
 		if err != nil {
 			return nil, errors.Wrap(err, "Current session is based on temporary credentials, but they were not retrieved.")
 		}
@@ -231,8 +197,7 @@ func (service *CredentialService) getTemporaryCredentials() (*CredentialResponse
 			Token:           credVal.SessionToken,
 		}
 
-		expiration, err := service.currentSession.Config.Credentials.ExpiresAt()
-
+		expiration := credVal.Expires
 		// It is valid for a credential provider to not return an expiration;
 		// however, we need to have an expiration if a token is present to
 		// satsify various client SDKs. In this case, we return an expiration
@@ -250,8 +215,8 @@ func (service *CredentialService) getTemporaryCredentials() (*CredentialResponse
 	}
 
 	// current session is not temp creds, so we can call GetSessionToken
-	creds, err := service.stsClient.GetSessionToken(&sts.GetSessionTokenInput{
-		DurationSeconds: aws.Int64(temporaryCredentialsDurationInS),
+	creds, err := service.stsClient.GetSessionToken(context.TODO(), &sts.GetSessionTokenInput{
+		DurationSeconds: aws.Int32(temporaryCredentialsDurationInS), 
 	})
 
 	if err != nil {
@@ -259,9 +224,9 @@ func (service *CredentialService) getTemporaryCredentials() (*CredentialResponse
 	}
 
 	response := CredentialResponse{
-		AccessKeyID:     aws.StringValue(creds.Credentials.AccessKeyId),
-		SecretAccessKey: aws.StringValue(creds.Credentials.SecretAccessKey),
-		Token:           aws.StringValue(creds.Credentials.SessionToken),
+		AccessKeyID:     *creds.Credentials.AccessKeyId,
+		SecretAccessKey: *creds.Credentials.SecretAccessKey,
+		Token:           *creds.Credentials.SessionToken,
 		Expiration:      creds.Credentials.Expiration.Format(CredentialExpirationTimeFormat),
 	}
 
@@ -269,8 +234,8 @@ func (service *CredentialService) getTemporaryCredentials() (*CredentialResponse
 }
 
 func (service *CredentialService) isCurrentSessionTemporary() bool {
-	if service.currentSession != nil && service.currentSession.Config != nil && service.currentSession.Config.Credentials != nil {
-		credVal, err := service.currentSession.Config.Credentials.Get()
+	if service.currentConfig != nil && service.currentConfig.Credentials != nil {
+		credVal, err := service.currentConfig.Credentials.Retrieve(context.TODO())
 
 		if err == nil && credVal.SessionToken != "" { // current session is already temp creds
 			return true

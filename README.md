@@ -1,3 +1,26 @@
+Fork Notes
+==========
+
+I forked this so I could use the SSO capabilities of the v2 version of the AWS SDK (I use 
+identity center locally).
+
+This isn't fully tested, but the /creds endpoint works (which is all my use case needs).
+
+I run with the following commands:
+
+```shell
+go build .
+go AWS_PROFILE=<my profile> ECS_LOCAL_METADATA_PORT=51679 go run main.go
+```
+
+Then I run this to validate:
+
+```shell
+curl -X GET http://127.0.0.1:51679/creds
+```
+
+I didn't need to run docker, but I assume you can build the docker image with the Makefile.
+
 Amazon ECS Local Container Endpoints
 ====================================
 
